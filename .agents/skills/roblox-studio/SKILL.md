@@ -101,13 +101,39 @@ Create a `Script`, `LocalScript`, or `ModuleScript` under `parent_path` with a `
 - Create a server script: `roblox_create_script("game.ServerScriptService", name="GameManager", script_type="Script", source="print('Hello Server')")`
 - Create a module script: `roblox_create_script("game.ReplicatedStorage", name="Config", script_type="ModuleScript", source="return { Version = 1 }")`
 
-### `roblox_take_viewport_screenshot` — VLA Viewport Screenshot
-Capture a visual screenshot of the Roblox Studio window/viewport for VLA (Vision-Language-Action) visual testing.
+### `roblox_take_viewport_screenshot` — Native Studio Viewport Screenshot
+Capture a PNG screenshot of the active Roblox Studio 3D viewport using `StudioCaptureService` (with optional on-demand fallback to `vision_bridge.py`).
 
-**Prerequisite:** Requires the Vision Bridge helper running in your interactive terminal: `python vision_bridge.py`.
+**Parameters:**
+- `ui_capture_mode`: `"all"` (default, includes UI overlays) or `"none"` (3D scene only)
+- `max_width`: Optional maximum width in pixels (proportionally scaled via `ScaleAsync`)
+- `position`: Optional `[x, y]` top-left pixel offset for region capture
+- `capture_size`: Optional `[width, height]` pixel size for region capture
+- `fallback_to_vision_bridge`: `True` (default) falls back to `vision_bridge.py` if `StudioCaptureService` cannot capture
 
-**Example use case:**
-- Capture current viewport image for VLA visual verification: `roblox_take_viewport_screenshot()`
+**Notes:**
+- First capture prompts a one-time Studio permission dialog (`RequestScreenshotPermissionAsync`).
+
+**Example use cases:**
+- Capture full viewport with UI: `roblox_take_viewport_screenshot()`
+- Capture 3D scene without UI overlays scaled to 1280px wide: `roblox_take_viewport_screenshot(ui_capture_mode="none", max_width=1280)`
+
+### `roblox_get_place_info` — Open Place Creator & Configured Upload Targets
+Inspect the currently open Roblox Studio place's `CreatorType` (`"User"` / `"Group"`), `CreatorId`, `GroupName`, `PlaceId`, and `GameId`, plus the non-secret creators configured in `.env`.
+
+### `roblox_upload_image_asset` — Open Cloud Image Upload
+Upload a local image (`.png`, `.jpeg`, `.bmp`, `.tga`, `< 8000x8000`, `<= 20 MB`) via Roblox Open Cloud Assets API v1 and return both the created asset ID and unwrapped `rbxassetid://` Image ID.
+
+**Parameters:**
+- `file_path`: Local image path
+- `display_name` / `description`: Asset title & description
+- `asset_type`: `"Decal"` (default, auto-unwraps inner `image_asset_id`) or `"Image"`
+- `creator_type`: `"auto"` (default, matches active Studio place against `.env` `ROBLOX_USER_ID`/`ROBLOX_GROUP_IDS`), `"user"`, or `"group"`
+- `creator_id`: Optional explicit ID or `.env` alias (e.g., `"dexite"`)
+- `expected_price`: Guard against unexpected Robux charges (default `0`)
+
+### `roblox_get_image_asset` — Read Existing Image/Decal Asset
+Read Open Cloud metadata and download an existing Image or Decal asset by ID (`"123456"` or `"rbxassetid://123456"`) to `assets_cache/` for inspection via `read_file`. Automatically unwraps Decal XML wrappers into raw image bytes (falling back to `thumbnails.roblox.com` for public/unowned assets).
 
 ## Common Workflows
 

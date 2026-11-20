@@ -10,6 +10,7 @@ for instant bidirectional communication — no polling needed.
 """
 
 import asyncio
+import base64
 import json
 import uuid
 import logging
@@ -20,6 +21,9 @@ import time
 from typing import Optional, Any
 
 from fastmcp import FastMCP
+import opencloud_assets
+
+opencloud_assets.load_env()
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -62,6 +66,8 @@ mcp = FastMCP(
         "roblox_get_player_state for player attributes and status, "
         "roblox_chat for in-game chat, "
         "roblox_wait_for to poll conditions, "
+        "roblox_get_place_info for open place CreatorId/CreatorType and configured upload targets, "
+        "roblox_upload_image_asset / roblox_get_image_asset for Open Cloud image uploads and asset reading, "
         "and roblox_start_playtest / roblox_stop_playtest for session control."
     ),
 )
@@ -71,6 +77,7 @@ mcp = FastMCP(
 # ---------------------------------------------------------------------------
 # pending_commands: {command_id: {"command": ..., "params": ..., "event": asyncio.Event, "result": ...}}
 pending_commands: dict[str, dict] = {}
+pending_chunks: dict[str, dict] = {}
 
 # Connected Roblox Studio WebSocket clients
 studio_connections: set = set()
@@ -89,6 +96,7 @@ CLIENT_ONLY_COMMANDS = {
     "look_at",
     "set_camera",
     "get_viewport_size",
+    "take_viewport_screenshot",
     "get_active_proximity_prompts",
     "get_ui_tree",
     "get_ui_design_properties",
@@ -99,7 +107,12 @@ CLIENT_ONLY_COMMANDS = {
 EDIT_ONLY_COMMANDS = set()
 
 
-async def send_command_to_studio(command: str, params: dict, target_context: Optional[str] = None) -> dict:
+async def send_command_to_studio(
+    command: str,
+    params: dict,
+    target_context: Optional[str] = None,
+    timeout: float = COMMAND_TIMEOUT,
+) -> dict:
     """
     Send a command to Roblox Studio via WebSocket and wait for the response.
     Supports intelligent context routing ('server' vs 'client' vs 'edit') to avoid multi-connection race conditions.
@@ -112,7 +125,8 @@ async def send_command_to_studio(command: str, params: dict, target_context: Opt
     resolved_target = target_context or params.get("target_context") or params.get("context")
     if not resolved_target or resolved_target in ("auto", "any"):
         if command in CLIENT_ONLY_COMMANDS:
-            resolved_target = "client"
+            has_client = any(connection_contexts.get(ws) == "client" for ws in studio_connections)
+            resolved_target = "client" if has_client else None
         elif command in EDIT_ONLY_COMMANDS:
             resolved_target = "edit"
         elif command == "execute_code":
@@ -173,11 +187,12 @@ async def send_command_to_studio(command: str, params: dict, target_context: Opt
 
     # Wait for response
     try:
-        await asyncio.wait_for(event.wait(), timeout=COMMAND_TIMEOUT)
+        await asyncio.wait_for(event.wait(), timeout=timeout)
     except asyncio.TimeoutError:
         del pending_commands[command_id]
+        pending_chunks.pop(command_id, None)
         ctx_info = f" (target_context: {resolved_target})" if resolved_target else ""
-        return {"error": f"Command '{command}' timed out after {COMMAND_TIMEOUT}s{ctx_info}. Studio may be unresponsive."}
+        return {"error": f"Command '{command}' timed out after {timeout}s{ctx_info}. Studio may be unresponsive."}
 
     result = pending_commands.pop(command_id)["result"]
     return result
@@ -311,44 +326,291 @@ async def roblox_get_viewport_size() -> str:
     return format_result(result)
 
 
-@mcp.tool()
-async def roblox_take_viewport_screenshot(crop_viewport: bool = True) -> str:
-    """
-    Take a visual screenshot of the Roblox Studio viewport/window for VLA (Vision-Language-Action) testing.
-    Automatically starts the Vision Bridge server in the background if not already running.
-
-    Args:
-        crop_viewport: If True (default), automatically crops strictly to the 3D Viewport canvas.
-                       If False, captures the full Studio window.
-
-    Returns:
-        JSON response with the captured screenshot file path, dimensions, and window title.
-    """
+def _capture_via_vision_bridge(crop_viewport: bool = True) -> dict:
+    """On-demand fallback using Vision Bridge HTTP server (:8001) or direct Win32 capture."""
     import urllib.request
-    import json
 
-    # Auto-start Vision Bridge if not responding
-    if not is_vision_bridge_running(8001):
-        start_vision_bridge_server(8001)
-
-    url = f"http://127.0.0.1:8001/capture?crop={'true' if crop_viewport else 'false'}"
-    try:
+    if is_vision_bridge_running(8001):
+        url = f"http://127.0.0.1:8001/capture?crop={'true' if crop_viewport else 'false'}"
         req = urllib.request.Request(url, headers={"User-Agent": "FastMCP"})
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            return json.dumps(data, indent=2)
-    except Exception as http_err:
-        # Fallback to direct in-process capture if HTTP endpoint failed
-        try:
-            import vision_bridge
-            result = vision_bridge.capture_studio_viewport(crop_viewport=crop_viewport)
-            return json.dumps(result, indent=2)
-        except Exception as direct_err:
-            return json.dumps({
-                "error": "Failed to capture Roblox Studio screenshot.",
-                "http_error": str(http_err),
-                "direct_error": str(direct_err),
-            }, indent=2)
+            data.setdefault("capture_method", "vision_bridge_http")
+            return data
+
+    import vision_bridge
+    result = vision_bridge.capture_studio_viewport(crop_viewport=crop_viewport)
+    if isinstance(result, dict):
+        result.setdefault("capture_method", "vision_bridge_direct")
+    return result
+
+
+def _save_studio_capture_png(data: dict) -> dict:
+    """Decode StudioCaptureService base64 buffer payload and save as a PNG file."""
+    b64_payload = data.get("image_base64")
+    if not b64_payload:
+        raise ValueError("Studio capture response missing 'image_base64' payload")
+
+    raw_bytes = base64.b64decode(b64_payload)
+    fmt = str(data.get("format", "PNG")).upper()
+    width = int(data.get("width", 0))
+    height = int(data.get("height", 0))
+
+    screenshots_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "screenshots"))
+    os.makedirs(screenshots_dir, exist_ok=True)
+    filename = f"roblox_viewport_{int(time.time() * 1000)}.png"
+    filepath = os.path.join(screenshots_dir, filename)
+
+    if fmt == "PNG":
+        with open(filepath, "wb") as f:
+            f.write(raw_bytes)
+    elif fmt == "RGBA8":
+        if width <= 0 or height <= 0:
+            raise ValueError(f"Invalid RGBA8 dimensions: {width}x{height}")
+        from PIL import Image as PILImage
+        img = PILImage.frombytes("RGBA", (width, height), raw_bytes)
+        img.save(filepath, format="PNG")
+    else:
+        raise ValueError(f"Unsupported capture buffer format: {fmt}")
+
+    return {
+        "success": True,
+        "filepath": filepath,
+        "filename": filename,
+        "width": width,
+        "height": height,
+        "original_size": data.get("original_size"),
+        "position": data.get("position"),
+        "format": "PNG",
+        "ui_capture_mode": data.get("ui_capture_mode"),
+        "byte_length": len(raw_bytes),
+        "capture_method": "StudioCaptureService",
+        "context": data.get("_context"),
+    }
+
+
+@mcp.tool()
+async def roblox_take_viewport_screenshot(
+    ui_capture_mode: str = "all",
+    max_width: Optional[int] = None,
+    position: Optional[list[int]] = None,
+    capture_size: Optional[list[int]] = None,
+    fallback_to_vision_bridge: bool = True,
+) -> str:
+    """
+    Capture a screenshot of the active Roblox Studio 3D viewport via StudioCaptureService.
+    Falls back to Vision Bridge on-demand if StudioCaptureService fails or is unavailable.
+
+    Args:
+        ui_capture_mode: Whether UI overlays (StarterGui/PlayerGui/CoreGui) are included.
+                         "all" (default) includes UI; "none" captures only the 3D scene.
+        max_width: Optional maximum image width in pixels; downscales proportionally via ScaleAsync if wider.
+        position: Optional [x, y] top-left pixel offset within the viewport for region capture.
+        capture_size: Optional [width, height] pixel region size to capture.
+        fallback_to_vision_bridge: If True (default), fall back to OS Vision Bridge capture if
+                                   StudioCaptureService cannot capture (e.g., Studio unfocused or denied).
+
+    Returns:
+        JSON response with the saved PNG filepath, dimensions, capture method, and metadata.
+    """
+    studio_error = None
+
+    if studio_connections:
+        params: dict[str, Any] = {"ui_capture_mode": ui_capture_mode}
+        if max_width is not None:
+            params["max_width"] = max_width
+        if position is not None:
+            params["position"] = position
+        if capture_size is not None:
+            params["capture_size"] = capture_size
+
+        result = await send_command_to_studio("take_viewport_screenshot", params, timeout=60.0)
+        if "error" not in result:
+            try:
+                saved = _save_studio_capture_png(result.get("data", {}))
+                return json.dumps(saved, indent=2)
+            except Exception as decode_err:
+                studio_error = f"Failed to process StudioCaptureService payload: {decode_err}"
+        else:
+            studio_error = result["error"]
+    else:
+        studio_error = "No Roblox Studio instance connected via WebSocket."
+
+    if not fallback_to_vision_bridge:
+        return json.dumps({
+            "success": False,
+            "error": studio_error,
+        }, indent=2)
+
+    # On-demand Vision Bridge fallback (not started unless primary capture fails)
+    try:
+        fallback_result = await asyncio.to_thread(_capture_via_vision_bridge, True)
+        if isinstance(fallback_result, dict):
+            fallback_result["primary_error"] = studio_error
+        return json.dumps(fallback_result, indent=2)
+    except Exception as fallback_err:
+        return json.dumps({
+            "success": False,
+            "error": "Failed to capture Roblox Studio screenshot via StudioCaptureService and Vision Bridge fallback.",
+            "studio_error": studio_error,
+            "fallback_error": str(fallback_err),
+        }, indent=2)
+
+
+async def _fetch_studio_place_info() -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Query active Studio place metadata (CreatorType, CreatorId, GroupName) with execute_code fallback."""
+    if not studio_connections:
+        return None, "No Roblox Studio instance connected via WebSocket."
+
+    res = await send_command_to_studio("get_place_info", {})
+    if "error" not in res and isinstance(res.get("data"), dict):
+        data = res["data"]
+        if "creator_id" in data and "creator_type" in data:
+            return data, None
+
+    err_msg = str(res.get("error", ""))
+    # Fallback when Studio plugin has not yet reloaded with CommandHandlers.get_place_info
+    if "Unknown command" in err_msg or "error" in res:
+        lua_snippet = (
+            'local hs = game:GetService("HttpService")\n'
+            'local gs = game:GetService("GroupService")\n'
+            'local gn = nil\n'
+            'if game.CreatorType == Enum.CreatorType.Group and game.CreatorId > 0 then\n'
+            '    pcall(function() local gi = gs:GetGroupInfoAsync(game.CreatorId); if gi then gn = gi.Name end end)\n'
+            'end\n'
+            'return hs:JSONEncode({\n'
+            '    place_id = game.PlaceId,\n'
+            '    game_id = game.GameId,\n'
+            '    name = game.Name,\n'
+            '    creator_type = game.CreatorType.Name,\n'
+            '    creator_id = game.CreatorId,\n'
+            '    group_name = gn,\n'
+            '})\n'
+        )
+        exec_res = await send_command_to_studio("execute_code", {"code": lua_snippet})
+        if "error" not in exec_res:
+            raw = (exec_res.get("data") or {}).get("result")
+            if isinstance(raw, str):
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict) and "creator_id" in parsed:
+                        return parsed, None
+                except json.JSONDecodeError:
+                    pass
+        return None, str(exec_res.get("error") or err_msg)
+
+    return None, err_msg
+
+
+@mcp.tool()
+async def roblox_get_place_info() -> str:
+    """
+    Get the open Roblox Studio place's ownership metadata (CreatorType, CreatorId, GroupName, PlaceId, GameId)
+    alongside non-secret Open Cloud creator targets configured in .env (ROBLOX_USER_ID / ROBLOX_GROUP_IDS).
+
+    Returns:
+        JSON with studio_place_info, studio_error (if disconnected), and configured_creators.
+    """
+    place_info, place_err = await _fetch_studio_place_info()
+    return json.dumps({
+        "studio_place_info": place_info,
+        "studio_error": place_err,
+        "configured_creators": opencloud_assets.describe_configured_creators(),
+    }, indent=2)
+
+
+@mcp.tool()
+async def roblox_upload_image_asset(
+    file_path: str,
+    display_name: Optional[str] = None,
+    description: str = "",
+    asset_type: str = "Decal",
+    creator_type: str = "auto",
+    creator_id: Optional[str] = None,
+    expected_price: int = 0,
+    wait_for_completion: bool = True,
+) -> str:
+    """
+    Upload a local image (.png, .jpeg, .bmp, .tga) to Roblox via Open Cloud Assets API v1.
+    When creator_type="auto" (default), inspects the open Studio place's CreatorType/CreatorId
+    and automatically picks the matching User ID or Group ID from .env.
+
+    Args:
+        file_path: Path to the local image file (<8000x8000 px, <=20 MB).
+        display_name: Optional asset title (defaults to filename stem, max 50 chars).
+        description: Optional asset description.
+        asset_type: "Decal" (default, creates inventory Decal and unwraps inner Image ID) or "Image".
+        creator_type: "auto" (default, match open Studio place), "user", or "group".
+        creator_id: Optional explicit numeric ID or alias from .env (e.g., "dexite").
+        expected_price: Expected Robux upload price guard (default 0).
+        wait_for_completion: If True (default), polls Open Cloud operation until assetId is ready.
+
+    Returns:
+        JSON with asset_id, image_asset_id, rbxassetid, moderation_state, creator, and creator_resolution.
+    """
+    place_info: Optional[dict[str, Any]] = None
+    if (creator_type or "auto").strip().lower() == "auto":
+        place_info, _ = await _fetch_studio_place_info()
+
+    try:
+        result = await asyncio.to_thread(
+            opencloud_assets.upload_image_asset,
+            file_path=file_path,
+            display_name=display_name,
+            description=description,
+            asset_type=asset_type,
+            creator_type=creator_type,
+            creator_id=creator_id,
+            expected_price=expected_price,
+            wait_for_completion=wait_for_completion,
+            place_info=place_info,
+        )
+        return json.dumps(result, indent=2)
+    except Exception as exc:
+        return json.dumps({
+            "success": False,
+            "error": str(exc),
+        }, indent=2)
+
+
+@mcp.tool()
+async def roblox_get_image_asset(
+    asset_id: str,
+    output_path: Optional[str] = None,
+    download_image: bool = True,
+    thumbnail_size: str = "420x420",
+    allow_thumbnail_fallback: bool = True,
+) -> str:
+    """
+    Read an existing Roblox Image or Decal asset by ID using Open Cloud APIs.
+    Fetches metadata, unwraps Decal XML wrappers into the inner Image ID, downloads raw image bytes
+    (via Asset Delivery API, falling back to Thumbnails API for public/unowned assets), and saves locally.
+
+    Args:
+        asset_id: Numeric asset ID, rbxassetid://..., or asset URL.
+        output_path: Optional local file path to save the downloaded image (defaults to assets_cache/).
+        download_image: If True (default), downloads the image file so it can be inspected via read_file.
+        thumbnail_size: Size used only when falling back to Thumbnails API (default "420x420").
+        allow_thumbnail_fallback: If True (default), uses public Thumbnails API if Asset Delivery returns 401/403.
+
+    Returns:
+        JSON with asset_id, resolved_image_asset_id, rbxassetid, filepath, width, height, format, and metadata.
+    """
+    try:
+        result = await asyncio.to_thread(
+            opencloud_assets.get_image_asset,
+            asset_id=asset_id,
+            output_path=output_path,
+            download_image=download_image,
+            thumbnail_size=thumbnail_size,
+            allow_thumbnail_fallback=allow_thumbnail_fallback,
+        )
+        return json.dumps(result, indent=2)
+    except Exception as exc:
+        return json.dumps({
+            "success": False,
+            "error": str(exc),
+        }, indent=2)
 
 
 @mcp.tool()
@@ -1118,6 +1380,29 @@ async def handle_studio_websocket(websocket):
                 await websocket.send(json.dumps({"id": command_id, "result": res}))
                 continue
 
+            # Reassemble chunked responses from Studio
+            if message.get("type") == "chunk":
+                idx = int(message.get("index", 0))
+                total = int(message.get("total", 0))
+                payload = message.get("payload", "")
+                if idx <= 0 or total <= 0:
+                    continue
+                bucket = pending_chunks.setdefault(command_id, {"total": total, "parts": {}})
+                bucket["parts"][idx] = payload
+                if len(bucket["parts"]) < total:
+                    continue
+                assembled = "".join(bucket["parts"].get(i, "") for i in range(1, total + 1))
+                pending_chunks.pop(command_id, None)
+                try:
+                    message = json.loads(assembled)
+                except json.JSONDecodeError:
+                    logger.warning(f"Invalid chunked JSON from Studio for command {command_id}")
+                    if command_id in pending_commands:
+                        entry = pending_commands[command_id]
+                        entry["result"] = {"error": "Failed to decode chunked JSON response from Studio."}
+                        entry["event"].set()
+                    continue
+
             # This is a response to a pending command from Roblox Studio
             if command_id in pending_commands:
                 entry = pending_commands[command_id]
@@ -1278,6 +1563,7 @@ async def start_websocket_server():
                 8000,
                 ping_interval=20,
                 ping_timeout=10,
+                max_size=32 * 1024 * 1024,
             )
             logger.info("🔌 WebSocket server listening on ws://127.0.0.1:8000")
             return server
@@ -1296,6 +1582,7 @@ async def start_websocket_server():
         8000,
         ping_interval=20,
         ping_timeout=10,
+        max_size=32 * 1024 * 1024,
     )
     logger.info("🔌 WebSocket server listening on ws://127.0.0.1:8000")
     return server
@@ -1307,10 +1594,7 @@ async def start_websocket_server():
 
 if __name__ == "__main__":
     async def main():
-        # Automatically start Vision Bridge server for screenshots in background
-        start_vision_bridge_server(8001)
-
-        # Start WebSocket server in background
+        # Start WebSocket server in background (Vision Bridge is launched on-demand only as fallback)
         ws_server = await start_websocket_server()
 
         try:

@@ -20,10 +20,21 @@ local LogService = game:GetService("LogService")
 local Selection = game:GetService("Selection")
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
+local GroupService = game:GetService("GroupService")
 
 local VirtualInputManager = nil
 pcall(function()
 	VirtualInputManager = game:GetService("VirtualInputManager")
+end)
+
+local StudioCaptureService = nil
+pcall(function()
+	StudioCaptureService = game:GetService("StudioCaptureService")
+end)
+
+local EncodingService = nil
+pcall(function()
+	EncodingService = game:GetService("EncodingService")
 end)
 
 local function getContextRole()
@@ -54,6 +65,7 @@ local isConnected = false
 local isConnecting = false
 local lastLoggedStatus = nil
 local connectionAttemptTime = 0
+local hasScreenshotPermission = false
 local toolbar = plugin:CreateToolbar("MCP Bridge")
 local toggleButton = toolbar:CreateButton("MCP Bridge", "Connect/Disconnect MCP Bridge", "rbxassetid://6031075938")
 
@@ -610,6 +622,196 @@ function CommandHandlers.get_viewport_size(params)
 	return {
 		width = viewportSize.X,
 		height = viewportSize.Y,
+	}
+end
+
+function CommandHandlers.get_place_info(_params)
+	local creatorType = game.CreatorType.Name
+	local creatorId = game.CreatorId
+	local groupName = nil
+
+	if game.CreatorType == Enum.CreatorType.Group and creatorId > 0 then
+		pcall(function()
+			local groupInfo = GroupService:GetGroupInfoAsync(creatorId)
+			if groupInfo and groupInfo.Name then
+				groupName = groupInfo.Name
+			end
+		end)
+	end
+
+	return {
+		place_id = game.PlaceId,
+		game_id = game.GameId,
+		name = game.Name,
+		creator_type = creatorType,
+		creator_id = creatorId,
+		group_name = groupName,
+	}
+end
+
+local function awaitScreenshotReady(capture, timeoutSeconds)
+	local deadline = os.clock() + (timeoutSeconds or 15)
+	while true do
+		local status = capture.BufferStatus
+		if status == Enum.StudioCaptureBufferStatus.Ready then
+			return true, nil
+		elseif status == Enum.StudioCaptureBufferStatus.Error then
+			local errs = {}
+			pcall(function()
+				errs = capture:GetErrors()
+			end)
+			if type(errs) == "table" and #errs > 0 then
+				return false, table.concat(errs, "; ")
+			end
+			return false, "StudioCaptureService reported BufferStatus.Error"
+		elseif os.clock() >= deadline then
+			return false, "Timed out waiting for StudioCaptureService screenshot buffer"
+		end
+		task.wait(0.03)
+	end
+end
+
+function CommandHandlers.take_viewport_screenshot(params)
+	if not StudioCaptureService then
+		return nil, "StudioCaptureService is unavailable in this Roblox Studio version"
+	end
+	if not EncodingService then
+		return nil, "EncodingService is unavailable in this Roblox Studio version"
+	end
+
+	-- Ensure screenshot permission has been granted; tolerate unimplemented RequestScreenshotPermissionAsync if CanCaptureScreenshot() is already true
+	if not hasScreenshotPermission or not StudioCaptureService:CanCaptureScreenshot() then
+		local okPerm, grantedOrErr = pcall(function()
+			return StudioCaptureService:RequestScreenshotPermissionAsync()
+		end)
+		if okPerm then
+			if not grantedOrErr then
+				hasScreenshotPermission = false
+				return nil, "Screenshot permission was denied or global plugin screenshot setting is disabled in Studio."
+			end
+			hasScreenshotPermission = true
+		elseif not StudioCaptureService:CanCaptureScreenshot() then
+			return nil, "RequestScreenshotPermissionAsync failed: " .. tostring(grantedOrErr)
+		end
+	end
+
+	if not StudioCaptureService:CanCaptureScreenshot() then
+		return nil, "StudioCaptureService:CanCaptureScreenshot() returned false (ensure Studio is not minimized and a 3D viewport is active)."
+	end
+
+	local uiModeStr = string.lower(tostring(params.ui_capture_mode or "all"))
+	local uiMode = if uiModeStr == "none" then Enum.UICaptureMode.None else Enum.UICaptureMode.All
+
+	local options = {
+		Format = Enum.StudioCaptureScreenshotFormat.PNG,
+		UICaptureMode = uiMode,
+	}
+
+	local hasExplicitRegion = false
+	if type(params.position) == "table" and #params.position >= 2 then
+		options.Position = Vector2.new(
+			math.max(0, math.floor(tonumber(params.position[1]) or 0)),
+			math.max(0, math.floor(tonumber(params.position[2]) or 0))
+		)
+		hasExplicitRegion = true
+	end
+	if type(params.capture_size) == "table" and #params.capture_size >= 2 then
+		local cw = tonumber(params.capture_size[1])
+		local ch = tonumber(params.capture_size[2])
+		if not cw or not ch or cw <= 0 or ch <= 0 then
+			return nil, "capture_size must contain two positive numbers [width, height]"
+		end
+		options.CaptureSize = Vector2.new(math.floor(cw), math.floor(ch))
+		hasExplicitRegion = true
+	end
+
+	local function attemptCapture(opts)
+		local okCall, capOrErr = pcall(function()
+			return StudioCaptureService:CaptureScreenshot(opts)
+		end)
+		if not okCall or not capOrErr then
+			return nil, tostring(capOrErr or "CaptureScreenshot returned nil")
+		end
+		local ready, readyErr = awaitScreenshotReady(capOrErr, 15)
+		if not ready then
+			return nil, readyErr
+		end
+		return capOrErr, nil
+	end
+
+	local capture, capErr = attemptCapture(options)
+
+	-- Fallback: if CaptureSize is required when omitted, retry using CurrentCamera.ViewportSize
+	if not capture and not hasExplicitRegion then
+		local camera = Workspace.CurrentCamera
+		if camera and camera.ViewportSize.X > 0 and camera.ViewportSize.Y > 0 then
+			local retryOpts = {
+				Position = options.Position or Vector2.new(0, 0),
+				CaptureSize = Vector2.new(math.floor(camera.ViewportSize.X), math.floor(camera.ViewportSize.Y)),
+				Format = Enum.StudioCaptureScreenshotFormat.PNG,
+				UICaptureMode = uiMode,
+			}
+			local retryCapture, retryErr = attemptCapture(retryOpts)
+			if retryCapture then
+				capture = retryCapture
+				capErr = nil
+			else
+				capErr = string.format("%s (retry with ViewportSize %dx%d failed: %s)", tostring(capErr), retryOpts.CaptureSize.X, retryOpts.CaptureSize.Y, tostring(retryErr))
+			end
+		end
+	end
+
+	if not capture then
+		return nil, "StudioCaptureService capture failed: " .. tostring(capErr)
+	end
+
+	local finalCapture = capture
+	local maxWidth = tonumber(params.max_width)
+	if maxWidth and maxWidth > 0 and capture.Resolution.X > maxWidth then
+		local targetWidth = math.max(1, math.floor(maxWidth))
+		local targetHeight = math.max(1, math.round(capture.Resolution.Y * (targetWidth / capture.Resolution.X)))
+		local okScale, scaledOrErr = pcall(function()
+			return capture:ScaleAsync(Enum.ResamplerMode.Default, Vector2.new(targetWidth, targetHeight))
+		end)
+		if okScale and scaledOrErr then
+			local scaleReady, scaleErr = awaitScreenshotReady(scaledOrErr, 15)
+			if scaleReady then
+				finalCapture = scaledOrErr
+			else
+				return nil, "ScaleAsync failed: " .. tostring(scaleErr)
+			end
+		else
+			return nil, "ScaleAsync error: " .. tostring(scaledOrErr)
+		end
+	end
+
+	local okBuf, rawBuf = pcall(function()
+		return finalCapture:GetBuffer()
+	end)
+	if not okBuf or not rawBuf then
+		return nil, "Failed to read capture buffer: " .. tostring(rawBuf)
+	end
+
+	local okEnc, b64Buf = pcall(function()
+		return EncodingService:Base64Encode(rawBuf)
+	end)
+	if not okEnc or not b64Buf then
+		return nil, "Failed to Base64-encode screenshot buffer: " .. tostring(b64Buf)
+	end
+
+	local b64Str = buffer.tostring(b64Buf)
+	local res = finalCapture.Resolution
+	local orig = finalCapture.OriginalSize
+
+	return {
+		format = finalCapture.BufferFormat.Name,
+		width = res.X,
+		height = res.Y,
+		original_size = { X = orig.X, Y = orig.Y },
+		position = { X = finalCapture.Position.X, Y = finalCapture.Position.Y },
+		ui_capture_mode = finalCapture.UICaptureMode.Name,
+		byte_length = buffer.len(rawBuf),
+		image_base64 = b64Str,
 	}
 end
 
@@ -2826,7 +3028,7 @@ local function processMessage(messageData)
 	else
 		response = {
 			id = commandId,
-			error = string.format("Unknown command: '%s'. Available: ls, ls_descendants, ls_summary, get_properties, get_by_tag, search, get_viewport_size, verify_script, create_script, get_ui_tree, get_ui_design_properties, inspect_ui_component, get_ui_palette, mount_story, unmount_story, list_mounted_stories, unmount_all_stories, execute_code, get_output_logs, set_properties, set_attribute, get_attributes, get_selection, set_selection, focus_on_selection, get_active_proximity_prompts, trigger_prompt, simulate_input, input_sequence, click_ui_element, world_to_screen, look_at, set_camera, teleport, equip_tool, get_player_state, get_playtest_mode, chat, wait_for, start_playtest, stop_playtest", command),
+			error = string.format("Unknown command: '%s'. Available: ls, ls_descendants, ls_summary, get_properties, get_by_tag, search, get_viewport_size, get_place_info, take_viewport_screenshot, verify_script, create_script, get_ui_tree, get_ui_design_properties, inspect_ui_component, get_ui_palette, mount_story, unmount_story, list_mounted_stories, unmount_all_stories, execute_code, get_output_logs, set_properties, set_attribute, get_attributes, get_selection, set_selection, focus_on_selection, get_active_proximity_prompts, trigger_prompt, simulate_input, input_sequence, click_ui_element, world_to_screen, look_at, set_camera, teleport, equip_tool, get_player_state, get_playtest_mode, chat, wait_for, start_playtest, stop_playtest", command),
 		}
 	end
 
@@ -2834,15 +3036,39 @@ local function processMessage(messageData)
 		response.context = myContext
 	end
 
-	-- Send response back
+	-- Send response back (chunk large payloads so WebSocket frame limits are never exceeded)
 	if wsClient then
 		local encodeSuccess, jsonResponse = pcall(function()
 			return HttpService:JSONEncode(response)
 		end)
 		if encodeSuccess then
-			pcall(function()
-				wsClient:Send(jsonResponse)
-			end)
+			local MAX_CHUNK_BYTES = 262144 -- 256 KiB
+			local totalLen = #jsonResponse
+			if totalLen <= MAX_CHUNK_BYTES then
+				pcall(function()
+					wsClient:Send(jsonResponse)
+				end)
+			else
+				local totalChunks = math.ceil(totalLen / MAX_CHUNK_BYTES)
+				for idx = 1, totalChunks do
+					local startPos = (idx - 1) * MAX_CHUNK_BYTES + 1
+					local endPos = math.min(idx * MAX_CHUNK_BYTES, totalLen)
+					local chunkEnvelope = HttpService:JSONEncode({
+						id = commandId,
+						type = "chunk",
+						index = idx,
+						total = totalChunks,
+						context = myContext,
+						payload = string.sub(jsonResponse, startPos, endPos),
+					})
+					local okSend = pcall(function()
+						wsClient:Send(chunkEnvelope)
+					end)
+					if not okSend then
+						break
+					end
+				end
+			end
 		else
 			-- Encoding failed - send error
 			pcall(function()

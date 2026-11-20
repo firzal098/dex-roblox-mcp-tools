@@ -1,3 +1,7 @@
 fastmcp
 uvicorn
 websockets
+httpx
+python-dotenv
+keyring
+pillow
